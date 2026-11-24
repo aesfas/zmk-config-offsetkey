@@ -1,0 +1,243 @@
+diff --git a/app/Kconfig b/app/Kconfig
+index 8c0675e..8179fac 100644
+--- a/app/Kconfig
++++ b/app/Kconfig
+@@ -725,3 +725,13 @@ osource "$(ZMK_CONFIG)/boards/shields/*/Kconfig.shield"
+ rsource "Kconfig.defaults"
+ 
+ source "Kconfig.zephyr"
++
++config OFFSETKEY_USB_RGB_ALWAYS_ON
++    bool "Keep Offsetkey RGB on while USB power is present"
++    depends on SOC_NRF52840 && ZMK_RGB_UNDERGLOW
++    depends on SHIELD_OFFSETKEY_PERIPHERAL_LEFT || SHIELD_OFFSETKEY_PERIPHERAL_RIGHT
++    default y
++    help
++      Read hardware VBUS with USB data disabled. Keep RGB on and prevent
++      deep sleep while powered; restore the battery RGB preference and idle
++      policy when unplugged. Does not change the RGB brightness limit.
+diff --git a/app/include/zmk/offsetkey_usb_power.h b/app/include/zmk/offsetkey_usb_power.h
+new file mode 100644
+index 0000000..8773e08
+--- /dev/null
++++ b/app/include/zmk/offsetkey_usb_power.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: MIT */
++#pragma once
++
++#include <zephyr/sys/util.h>
++#if IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
++#include <hal/nrf_power.h>
++
++static inline bool offsetkey_usb_power_present(void) {
++    return nrf_power_usbregstatus_vbusdet_get(NRF_POWER);
++}
++#endif
+diff --git a/app/src/activity.c b/app/src/activity.c
+index d38bf05..67bb939 100644
+--- a/app/src/activity.c
++++ b/app/src/activity.c
+@@ -21,6 +21,7 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+ #include <zmk/pm.h>
+ 
+ #include <zmk/activity.h>
++#include <zmk/offsetkey_usb_power.h>
+ 
+ #if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
+ #include <zmk/usb.h>
+@@ -35,7 +36,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+ #endif
+ 
+ bool is_usb_power_present(void) {
+-#if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
++#if IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
++    return offsetkey_usb_power_present();
++#elif IS_ENABLED(CONFIG_USB_DEVICE_STACK)
+     return zmk_usb_is_powered();
+ #else
+     return false;
+diff --git a/app/src/rgb_underglow.c b/app/src/rgb_underglow.c
+index 3453fb4..59f8918 100644
+--- a/app/src/rgb_underglow.c
++++ b/app/src/rgb_underglow.c
+@@ -25,6 +25,7 @@
+ #include <zmk/events/activity_state_changed.h>
+ #include <zmk/events/usb_conn_state_changed.h>
+ #include <zmk/workqueue.h>
++#include <zmk/offsetkey_usb_power.h>
+ 
+ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
+ 
+@@ -66,6 +67,15 @@ static struct led_rgb pixels[STRIP_NUM_PIXELS];
+ 
+ static struct rgb_underglow_state state;
+ 
++#if IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
++/* state.on remains the user's battery preference, never the USB override. */
++static bool offsetkey_output_on;
++static bool offsetkey_output_initialized;
++static int offsetkey_rgb_apply(void);
++static void offsetkey_power_poll(struct k_work *work);
++K_WORK_DELAYABLE_DEFINE(offsetkey_power_work, offsetkey_power_poll);
++#endif
++
+ #if IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_EXT_POWER)
+ static const struct device *const ext_power = DEVICE_DT_GET(DT_INST(0, zmk_ext_power_generic));
+ #endif
+@@ -200,7 +210,11 @@ static void zmk_rgb_underglow_tick(struct k_work *work) {
+ K_WORK_DEFINE(underglow_tick_work, zmk_rgb_underglow_tick);
+ 
+ static void zmk_rgb_underglow_tick_handler(struct k_timer *timer) {
++#if IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
++    if (!offsetkey_output_on) {
++#else
+     if (!state.on) {
++#endif
+         return;
+     }
+ 
+@@ -221,9 +235,13 @@ static int rgb_settings_set(const char *name, size_t len, settings_read_cb read_
+ 
+         rc = read_cb(cb_arg, &state, sizeof(state));
+         if (rc >= 0) {
++#if IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
++            offsetkey_rgb_apply();
++#else
+             if (state.on) {
+                 k_timer_start(&underglow_tick, K_NO_WAIT, K_MSEC(50));
+             }
++#endif
+ 
+             return 0;
+         }
+@@ -273,9 +291,14 @@ static int zmk_rgb_underglow_init(void) {
+     state.on = zmk_usb_is_powered();
+ #endif
+ 
++#if IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
++    offsetkey_rgb_apply();
++    k_work_reschedule(&offsetkey_power_work, K_MSEC(250));
++#else
+     if (state.on) {
+         k_timer_start(&underglow_tick, K_NO_WAIT, K_MSEC(50));
+     }
++#endif
+ 
+     return 0;
+ }
+@@ -297,6 +320,13 @@ int zmk_rgb_underglow_get_state(bool *on_off) {
+     return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
++int zmk_rgb_underglow_on(void) {
++    state.on = true;
++    int rc = offsetkey_rgb_apply();
++    return rc < 0 ? rc : zmk_rgb_underglow_save_state();
++}
++#else
+ int zmk_rgb_underglow_on(void) {
+     if (!led_strip)
+         return -ENODEV;
+@@ -317,6 +347,8 @@ int zmk_rgb_underglow_on(void) {
+     return zmk_rgb_underglow_save_state();
+ }
+ 
++#endif
++
+ static void zmk_rgb_underglow_off_handler(struct k_work *work) {
+     for (int i = 0; i < STRIP_NUM_PIXELS; i++) {
+         pixels[i] = (struct led_rgb){r : 0, g : 0, b : 0};
+@@ -327,6 +359,51 @@ static void zmk_rgb_underglow_off_handler(struct k_work *work) {
+ 
+ K_WORK_DEFINE(underglow_off_work, zmk_rgb_underglow_off_handler);
+ 
++#if IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
++static int offsetkey_rgb_apply(void) {
++    bool powered = offsetkey_usb_power_present();
++    bool active = !IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_AUTO_OFF_IDLE) ||
++                  zmk_activity_get_state() == ZMK_ACTIVITY_ACTIVE;
++    bool target = powered || (state.on && active);
++
++    if (!device_is_ready(led_strip)) {
++        return -ENODEV;
++    }
++    if (offsetkey_output_initialized && target == offsetkey_output_on) {
++        return 0;
++    }
++#if IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_EXT_POWER)
++    int rc = target ? ext_power_enable(ext_power) : ext_power_disable(ext_power);
++    if (rc < 0) {
++        return rc;
++    }
++#endif
++    offsetkey_output_initialized = true;
++    offsetkey_output_on = target;
++    if (target) {
++        /* Discard a queued blanking frame before starting the animation. */
++        k_work_cancel(&underglow_off_work);
++        state.animation_step = 0;
++        k_timer_start(&underglow_tick, K_NO_WAIT, K_MSEC(50));
++    } else {
++        k_timer_stop(&underglow_tick);
++        k_work_submit_to_queue(zmk_workqueue_lowprio_work_q(), &underglow_off_work);
++    }
++    return 0;
++}
++
++static void offsetkey_power_poll(struct k_work *work) {
++    /* Read VBUS directly: peripheral USB data is intentionally disabled. */
++    offsetkey_rgb_apply();
++    k_work_reschedule(&offsetkey_power_work, K_MSEC(250));
++}
++
++int zmk_rgb_underglow_off(void) {
++    state.on = false;
++    int rc = offsetkey_rgb_apply();
++    return rc < 0 ? rc : zmk_rgb_underglow_save_state();
++}
++#else
+ int zmk_rgb_underglow_off(void) {
+     if (!led_strip)
+         return -ENODEV;
+@@ -348,6 +425,8 @@ int zmk_rgb_underglow_off(void) {
+     return zmk_rgb_underglow_save_state();
+ }
+ 
++#endif
++
+ int zmk_rgb_underglow_calc_effect(int direction) {
+     return (state.current_effect + UNDERGLOW_EFFECT_NUMBER + direction) % UNDERGLOW_EFFECT_NUMBER;
+ }
+@@ -462,6 +541,7 @@ int zmk_rgb_underglow_change_spd(int direction) {
+ 
+ #if IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_AUTO_OFF_IDLE) ||                                          \
+     IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_AUTO_OFF_USB)
++#if !IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
+ struct rgb_underglow_sleep_state {
+     bool is_awake;
+     bool rgb_state_before_sleeping;
+@@ -491,7 +571,15 @@ static int rgb_underglow_auto_state(bool target_wake_state) {
+     }
+ }
+ 
++#endif
++
+ static int rgb_underglow_event_listener(const zmk_event_t *eh) {
++#if IS_ENABLED(CONFIG_OFFSETKEY_USB_RGB_ALWAYS_ON)
++    if (as_zmk_activity_state_changed(eh)) {
++        return offsetkey_rgb_apply();
++    }
++    return -ENOTSUP;
++#else
+ 
+ #if IS_ENABLED(CONFIG_ZMK_RGB_UNDERGLOW_AUTO_OFF_IDLE)
+     if (as_zmk_activity_state_changed(eh)) {
+@@ -506,6 +594,7 @@ static int rgb_underglow_event_listener(const zmk_event_t *eh) {
+ #endif
+ 
+     return -ENOTSUP;
++#endif
+ }
+ 
+ ZMK_LISTENER(rgb_underglow, rgb_underglow_event_listener);
